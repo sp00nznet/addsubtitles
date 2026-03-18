@@ -39,6 +39,18 @@ python grab_subs.py --dir "D:/Movies" --lang eng
 
 That's it. Subtitles will appear next to each video file as `.eng.srt`.
 
+### 3. Configure Providers (optional but recommended)
+
+Create a `config.toml` file in the script directory to enable authenticated providers. This file is **gitignored** and never committed.
+
+```toml
+[opensubtitles]
+username = "your_username"
+password = "your_password"
+```
+
+OpenSubtitles requires a free account to download subtitles. Sign up at [opensubtitles.com](https://www.opensubtitles.com/) and add your credentials above. Without this, the OpenSubtitles provider will be skipped.
+
 ---
 
 ## Usage
@@ -51,6 +63,7 @@ python grab_subs.py --dir <path> [options]
 |------|-------|-------------|---------|
 | `--dir` | `-d` | Root directory to scan (required) | — |
 | `--lang` | `-l` | Subtitle language ([ISO 639-3](https://en.wikipedia.org/wiki/List_of_ISO_639-3_codes)) | `eng` |
+| `--delay` | | Seconds between each lookup to avoid rate limits | `3.0` |
 | `--overwrite` | | Re-download even if a subtitle already exists | off |
 | `--providers` | `-p` | Space-separated list of providers to use | `opensubtitlescom podnapisi gestdown` |
 | `--verbose` | `-v` | Show debug-level output (provider queries, scoring) | off |

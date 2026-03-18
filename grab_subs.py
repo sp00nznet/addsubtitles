@@ -14,10 +14,23 @@ Usage:
 import argparse
 import csv
 import datetime
+import io
 import logging
 import os
 import sys
+import time
 from pathlib import Path
+
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib  # Python < 3.11
+
+# Fix Windows console encoding — lets us print Unicode filenames (e.g. Cyrillic)
+# without crashing on cp1252.
+if sys.platform == "win32":
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
 
 try:
     import subliminal
@@ -37,6 +50,36 @@ LOG_TIMESTAMP = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
 LOG_FILE = LOG_DIR / f"subtitle_log_{LOG_TIMESTAMP}.csv"
 TEXT_LOG = LOG_DIR / f"subtitle_log_{LOG_TIMESTAMP}.txt"
 
+CONFIG_FILE = LOG_DIR / "config.toml"
+
+# Rate-limit retry settings
+MAX_RETRIES = 3
+RETRY_BACKOFF_BASE = 10  # seconds; doubles each retry
+
+
+def load_config() -> dict:
+    """Load provider credentials from config.toml."""
+    if not CONFIG_FILE.exists():
+        return {}
+    with open(CONFIG_FILE, "rb") as f:
+        return tomllib.load(f)
+
+
+def build_provider_configs(config: dict) -> dict:
+    """Build subliminal provider_configs dict from config.toml."""
+    provider_configs = {}
+    os_cfg = config.get("opensubtitles", {})
+    if os_cfg.get("username") and os_cfg.get("password"):
+        creds = {
+            "username": os_cfg["username"],
+            "password": os_cfg["password"],
+        }
+        # Apply to both .org and .com providers
+        provider_configs["opensubtitles"] = creds
+        provider_configs["opensubtitlescom"] = creds
+        logging.info("OpenSubtitles credentials loaded from config.toml")
+    return provider_configs
+
 
 def setup_logging(verbose: bool) -> None:
     level = logging.DEBUG if verbose else logging.INFO
@@ -49,6 +92,21 @@ def setup_logging(verbose: bool) -> None:
     if not verbose:
         logging.getLogger("subliminal").setLevel(logging.WARNING)
         logging.getLogger("enzyme").setLevel(logging.WARNING)
+
+
+def configure_cache() -> None:
+    """Configure subliminal's cache in a cross-platform way."""
+    if sys.platform == "win32":
+        # DBM backend requires fcntl (Unix-only). On Windows it configures
+        # fine but crashes on first access inside provider code, which causes
+        # subliminal to discard the provider entirely. Use memory cache instead.
+        subliminal.region.configure("dogpile.cache.memory")
+    else:
+        cache_file = LOG_DIR / "subliminal_cache.dbm"
+        subliminal.region.configure(
+            "dogpile.cache.dbm",
+            arguments={"filename": str(cache_file)},
+        )
 
 
 def find_videos(directory: str) -> list[Path]:
@@ -74,24 +132,68 @@ def scan_videos(paths: list[Path]) -> list:
     return scanned
 
 
+def list_subtitles_with_retry(pool, video, language_set, delay: float) -> list:
+    """Query providers for subtitles, retrying on 429 with exponential backoff."""
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            subs = pool.list_subtitles(video, language_set)
+            return subs
+        except Exception as exc:
+            if "429" in str(exc) and attempt < MAX_RETRIES:
+                wait = RETRY_BACKOFF_BASE * (2 ** attempt)
+                logging.warning(
+                    "Rate limited (429). Waiting %ds before retry %d/%d...",
+                    wait, attempt + 1, MAX_RETRIES,
+                )
+                time.sleep(wait)
+            else:
+                raise
+    return []
+
+
+def download_subtitle_with_retry(pool, subtitle, delay: float) -> bool:
+    """Download a subtitle, retrying on 429 with exponential backoff."""
+    for attempt in range(MAX_RETRIES + 1):
+        try:
+            pool.download_subtitle(subtitle)
+            return True
+        except Exception as exc:
+            if "429" in str(exc) and attempt < MAX_RETRIES:
+                wait = RETRY_BACKOFF_BASE * (2 ** attempt)
+                logging.warning(
+                    "Rate limited on download (429). Waiting %ds before retry %d/%d...",
+                    wait, attempt + 1, MAX_RETRIES,
+                )
+                time.sleep(wait)
+            else:
+                raise
+    return False
+
+
 def download_subtitles(
     videos: list,
     language: Language,
     providers: list[str] | None = None,
+    provider_configs: dict | None = None,
     overwrite: bool = False,
+    delay: float = 3.0,
 ) -> list[dict]:
     """Download best-match subtitles for each video. Returns a log list."""
 
     results = []
-    default_providers = ["opensubtitlescom", "podnapisi", "gestdown"]
+    default_providers = ["opensubtitles", "opensubtitlescom", "podnapisi", "gestdown"]
 
     active_providers = providers or default_providers
 
     logging.info("Using subtitle providers: %s", ", ".join(active_providers))
     logging.info("Target language: %s", language)
+    logging.info("Delay between requests: %.1fs", delay)
 
-    with subliminal.core.ProviderPool(providers=active_providers) as pool:
-        for video in videos:
+    with subliminal.core.ProviderPool(
+        providers=active_providers,
+        provider_configs=provider_configs or {},
+    ) as pool:
+        for i, video in enumerate(videos):
             entry = {
                 "file": str(video.name),
                 "directory": str(Path(video.name).parent) if hasattr(video, "name") else "",
@@ -109,10 +211,18 @@ def download_subtitles(
                 results.append(entry)
                 continue
 
-            logging.info("Searching subtitles for: %s", video_path.name)
+            # Throttle: wait between requests (skip delay on first item)
+            if i > 0 and delay > 0:
+                logging.debug("Waiting %.1fs before next request...", delay)
+                time.sleep(delay)
+
+            logging.info(
+                "[%d/%d] Searching subtitles for: %s",
+                i + 1, len(videos), video_path.name,
+            )
 
             try:
-                subs = pool.list_subtitles(video, {language})
+                subs = list_subtitles_with_retry(pool, video, {language}, delay)
             except Exception as exc:
                 logging.error("Provider error for %s: %s", video_path.name, exc)
                 entry["status"] = f"error: {exc}"
@@ -127,7 +237,6 @@ def download_subtitles(
 
             # Score and pick the best subtitle (subliminal scores by hash,
             # release group, resolution, source, etc.)
-            scored = subliminal.score.compute_score(subs[0], video)
             best = sorted(
                 subs,
                 key=lambda s: subliminal.score.compute_score(s, video),
@@ -138,7 +247,7 @@ def download_subtitles(
 
             # Download the subtitle content
             try:
-                pool.download_subtitle(chosen)
+                download_subtitle_with_retry(pool, chosen, delay)
             except Exception as exc:
                 logging.error("Download failed for %s: %s", video_path.name, exc)
                 entry["status"] = f"download error: {exc}"
@@ -272,6 +381,12 @@ def main() -> None:
         help="Subtitle language as a 3-letter ISO 639-3 code (default: eng).",
     )
     parser.add_argument(
+        "--delay",
+        type=float,
+        default=3.0,
+        help="Seconds to wait between each video lookup to avoid rate limits (default: 3.0).",
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Re-download even if a subtitle file already exists.",
@@ -297,15 +412,14 @@ def main() -> None:
 
     language = Language(args.lang)
 
-    # Configure subliminal cache (speeds up repeated runs)
-    cache_file = LOG_DIR / "subliminal_cache.dbm"
-    subliminal.region.configure(
-        "dogpile.cache.dbm",
-        arguments={"filename": str(cache_file)},
-    )
+    configure_cache()
+
+    config = load_config()
+    provider_configs = build_provider_configs(config)
 
     print(f"Scanning: {scan_dir}")
     print(f"Language: {language}")
+    print(f"Delay:   {args.delay}s between requests")
     print()
 
     video_paths = find_videos(str(scan_dir))
@@ -320,7 +434,13 @@ def main() -> None:
         sys.exit(0)
 
     print(f"Parsed {len(videos)} video(s). Searching for subtitles...\n")
-    results = download_subtitles(videos, language, providers=args.providers, overwrite=args.overwrite)
+    results = download_subtitles(
+        videos, language,
+        providers=args.providers,
+        provider_configs=provider_configs,
+        overwrite=args.overwrite,
+        delay=args.delay,
+    )
 
     write_log(results)
     print_summary(results)

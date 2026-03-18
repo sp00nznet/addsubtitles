@@ -3,3 +3,5 @@ __pycache__/
 *.dbm
 *.db
 subtitle_log_*
+config.toml
+credfile*
