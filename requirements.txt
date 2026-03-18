@@ -1,0 +1,2 @@
+subliminal>=2.1.0
+babelfish>=0.6.0
